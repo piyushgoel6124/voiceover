@@ -1,7 +1,8 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.responses import FileResponse
 from gtts import gTTS
+from pydub import AudioSegment
 import ffmpeg, pysrt, uuid, os, random, requests
 
 app = FastAPI()
@@ -29,19 +30,19 @@ def generate_subtitles(text, srt_path):
     t = 0.0
     for i, sent in enumerate(sentences, start=1):
         duration = max(len(sent.split()) / 2.0, 2)
-        sub = pysrt.SubRipItem(index=i,
-                               start=pysrt.SubRipTime(seconds=t),
-                               end=pysrt.SubRipTime(seconds=t + duration),
-                               text=sent)
-        subs.append(sub)
+        subs.append(pysrt.SubRipItem(index=i,
+                                     start=pysrt.SubRipTime(seconds=t),
+                                     end=pysrt.SubRipTime(seconds=t + duration),
+                                     text=sent))
         t += duration
     subs.save(srt_path, encoding='utf-8')
     return t
 
 def download_video(url, dest_path):
     r = requests.get(url, stream=True)
+    r.raise_for_status()
     with open(dest_path, "wb") as f:
-        for chunk in r.iter_content(chunk_size=8192):
+        for chunk in r.iter_content(8192):
             f.write(chunk)
 
 @app.post("/narrate")
@@ -49,59 +50,58 @@ async def narrate(req: NarrationRequest):
     uid = uuid.uuid4().hex
     text = req.text
 
-    voice_path = os.path.join(OUT_DIR, f"{uid}_voice.mp3")
-    srt_path = os.path.join(OUT_DIR, f"{uid}.srt")
-    overlay_path = os.path.join(OUT_DIR, f"{uid}_overlay.mp4")
-    bg_path = os.path.join(OUT_DIR, f"{uid}_bg.mp4")
+    voice_mp3 = os.path.join(OUT_DIR, f"{uid}_voice.mp3")
+    voice_wav = os.path.join(OUT_DIR, f"{uid}_voice.wav")
+    srt_file = os.path.join(OUT_DIR, f"{uid}.srt")
+    overlay_vid = os.path.join(OUT_DIR, f"{uid}_overlay.mp4")
+    bg_vid = os.path.join(OUT_DIR, f"{uid}_bg.mp4")
     trimmed_bg = os.path.join(OUT_DIR, f"{uid}_bg_trimmed.mp4")
-    final_output = os.path.join(OUT_DIR, f"{uid}_final.mp4")
+    final_vid = os.path.join(OUT_DIR, f"{uid}_final.mp4")
 
-    # 1. Generate voice
-    gTTS(text).save(voice_path)
+    try:
+        # 1. TTS -> MP3
+        gTTS(text).save(voice_mp3)
+        # 2. Normalize to WAV
+        AudioSegment.from_mp3(voice_mp3).export(voice_wav, format="wav")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TTS error: {e}")
 
-    # 2. Generate subs
-    duration = generate_subtitles(text, srt_path)
+    duration = generate_subtitles(text, srt_file)
 
-    # 3. Create transparent voice+subtitles overlay
+    try:
+        (
+            ffmpeg
+            .input(f"color=black@0.0:s=720x1280:d={duration}", f="lavfi")
+            .output(overlay_vid,
+                    i=voice_wav,
+                    vf=f"subtitles='{srt_file}':force_style='Fontsize=48,PrimaryColour=&HFFFFFF&'",
+                    acodec="aac", vcodec="libx264", pix_fmt="yuva420p", shortest=None, y=None)
+            .run()
+        )
+    except ffmpeg.Error as e:
+        raise HTTPException(status_code=500, detail=f"Overlay error: {e.stderr.decode()}")
+
+    download_video(random.choice(DROPBOX_CLIPS), bg_vid)
+
     (
         ffmpeg
-        .input(f"color=black@0.0:s=720x1280:d={duration}", f='lavfi')
-        .output(overlay_path,
-                i=voice_path,
-                vf=f"subtitles='{srt_path}':force_style='Fontsize=48,PrimaryColour=&HFFFFFF&'",
-                acodec='aac',
-                vcodec='libx264',
-                pix_fmt='yuva420p',
-                shortest=None,
-                y=None)
-        .run()
-    )
-
-    # 4. Pick + download random Subway Surfer clip
-    dropbox_url = random.choice(DROPBOX_CLIPS)
-    download_video(dropbox_url, bg_path)
-
-    # 5. Trim background to voice length
-    (
-        ffmpeg
-        .input(bg_path)
+        .input(bg_vid)
         .output(trimmed_bg, t=duration, y=None)
         .run()
     )
 
-    # 6. Overlay subtitles+voice on Subway Surfer
     (
         ffmpeg
         .input(trimmed_bg)
-        .input(overlay_path)
+        .input(overlay_vid)
         .filter_complex("[0:v][1:v] overlay=0:0")
-        .output(final_output, vcodec='libx264', acodec='aac', pix_fmt='yuv420p', shortest=None, y=None)
+        .output(final_vid, vcodec="libx264", acodec="aac", pix_fmt="yuv420p", shortest=None, y=None)
         .run()
     )
 
-    return {"video_url": f"/output/{os.path.basename(final_output)}"}
+    return {"video_url": f"/output/{os.path.basename(final_vid)}"}
 
 @app.get("/output/{filename}")
 def serve_output_file(filename: str):
-    file_path = os.path.join(OUT_DIR, filename)
-    return FileResponse(file_path, media_type="video/mp4")
+    file = os.path.join(OUT_DIR, filename)
+    return FileResponse(file, media_type="video/mp4")
