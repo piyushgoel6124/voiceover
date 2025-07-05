@@ -1,7 +1,4 @@
 fastapi
 uvicorn
-gtts
-pydub
-requests
-pysrt
+gTTS
 ffmpeg-python
