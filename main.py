@@ -2,11 +2,23 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.responses import FileResponse
 from gtts import gTTS
-import ffmpeg, pysrt, uuid, os, random
+import ffmpeg, pysrt, uuid, os, random, requests
 
 app = FastAPI()
 OUT_DIR = "/tmp"
-SS_DIR = "./ss"  # Place your Subway Surfer videos here
+
+DROPBOX_CLIPS = [
+    "https://www.dropbox.com/scl/fi/xm6jnoddq3cz3ms9tr19i/1.mp4?raw=1",
+    "https://www.dropbox.com/scl/fi/touw1m2pi1knk7xhbvcip/2.mp4?raw=1",
+    "https://www.dropbox.com/scl/fi/3ae6zxy49xhrf78qzarqi/3.mp4?raw=1",
+    "https://www.dropbox.com/scl/fi/yisak216d9smf29x3hukg/4.mp4?raw=1",
+    "https://www.dropbox.com/scl/fi/1d3i3qgv17u8swj2kqh5c/5.mp4?raw=1",
+    "https://www.dropbox.com/scl/fi/q0iqv2eaogwxea6djl7iv/6.mp4?raw=1",
+    "https://www.dropbox.com/scl/fi/61hxbubhmoktjoeb0ewjm/7.mp4?raw=1",
+    "https://www.dropbox.com/scl/fi/d0oj89f6y3vpzxyf8126p/8.mp4?raw=1",
+    "https://www.dropbox.com/scl/fi/7abb22yzw74ikbpug7wqf/9.mp4?raw=1",
+    "https://www.dropbox.com/scl/fi/ztje3cq6neq2x2fa4wamg/10.mp4?raw=1"
+]
 
 class NarrationRequest(BaseModel):
     text: str
@@ -24,7 +36,13 @@ def generate_subtitles(text, srt_path):
         subs.append(sub)
         t += duration
     subs.save(srt_path, encoding='utf-8')
-    return t  # total duration of script
+    return t
+
+def download_video(url, dest_path):
+    r = requests.get(url, stream=True)
+    with open(dest_path, "wb") as f:
+        for chunk in r.iter_content(chunk_size=8192):
+            f.write(chunk)
 
 @app.post("/narrate")
 async def narrate(req: NarrationRequest):
@@ -34,18 +52,20 @@ async def narrate(req: NarrationRequest):
     voice_path = os.path.join(OUT_DIR, f"{uid}_voice.mp3")
     srt_path = os.path.join(OUT_DIR, f"{uid}.srt")
     overlay_path = os.path.join(OUT_DIR, f"{uid}_overlay.mp4")
-    final_path = os.path.join(OUT_DIR, f"{uid}_final.mp4")
+    bg_path = os.path.join(OUT_DIR, f"{uid}_bg.mp4")
+    trimmed_bg = os.path.join(OUT_DIR, f"{uid}_bg_trimmed.mp4")
+    final_output = os.path.join(OUT_DIR, f"{uid}_final.mp4")
 
-    # Generate voice
+    # 1. Generate voice
     gTTS(text).save(voice_path)
 
-    # Generate subtitles
+    # 2. Generate subs
     duration = generate_subtitles(text, srt_path)
 
-    # Create transparent overlay with voice and subs
+    # 3. Create transparent voice+subtitles overlay
     (
         ffmpeg
-        .input('color=black@0.0:s=720x1280:d={}'.format(duration), f='lavfi')
+        .input(f"color=black@0.0:s=720x1280:d={duration}", f='lavfi')
         .output(overlay_path,
                 i=voice_path,
                 vf=f"subtitles='{srt_path}':force_style='Fontsize=48,PrimaryColour=&HFFFFFF&'",
@@ -57,31 +77,31 @@ async def narrate(req: NarrationRequest):
         .run()
     )
 
-    # Choose random Subway Surfer clip
-    subway_clip = random.choice([os.path.join(SS_DIR, f) for f in os.listdir(SS_DIR) if f.endswith(".mp4")])
+    # 4. Pick + download random Subway Surfer clip
+    dropbox_url = random.choice(DROPBOX_CLIPS)
+    download_video(dropbox_url, bg_path)
 
-    # Trim background to match audio duration
-    trimmed_ss = os.path.join(OUT_DIR, f"{uid}_bg_trimmed.mp4")
+    # 5. Trim background to voice length
     (
         ffmpeg
-        .input(subway_clip)
-        .output(trimmed_ss, t=duration, y=None)
+        .input(bg_path)
+        .output(trimmed_bg, t=duration, y=None)
         .run()
     )
 
-    # Overlay the voice+subtitles over Subway Surfer
+    # 6. Overlay subtitles+voice on Subway Surfer
     (
         ffmpeg
-        .input(trimmed_ss)
+        .input(trimmed_bg)
         .input(overlay_path)
         .filter_complex("[0:v][1:v] overlay=0:0")
-        .output(final_path, vcodec='libx264', acodec='aac', pix_fmt='yuv420p', shortest=None, y=None)
+        .output(final_output, vcodec='libx264', acodec='aac', pix_fmt='yuv420p', shortest=None, y=None)
         .run()
     )
 
-    return {"final_video_url": f"/output/{os.path.basename(final_path)}"}
+    return {"video_url": f"/output/{os.path.basename(final_output)}"}
 
 @app.get("/output/{filename}")
 def serve_output_file(filename: str):
-    path = os.path.join(OUT_DIR, filename)
-    return FileResponse(path, media_type="video/mp4")
+    file_path = os.path.join(OUT_DIR, filename)
+    return FileResponse(file_path, media_type="video/mp4")
