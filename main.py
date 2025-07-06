@@ -1,46 +1,45 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from gtts import gTTS
-import ffmpeg
 import uuid
 import os
+import threading
+import time
 
 app = FastAPI()
 
-@app.post("/generate_voice/")
-async def generate_voice(req: Request):
-    data = await req.json()
-    text = data.get("text", "").strip()
+def remove_file_later(path, delay=10):
+    def delayed_delete():
+        time.sleep(delay)
+        try:
+            os.remove(path)
+            print(f"🧹 Deleted: {path}")
+        except Exception as e:
+            print(f"⚠️ Failed to delete {path}: {e}")
+    threading.Thread(target=delayed_delete).start()
 
-    if not text:
-        return {"error": "Missing text"}
+@app.get("/")
+async def root():
+    return JSONResponse(content={"status": "ok", "message": "Voiceover API is live 🎙️"})
 
-    uid = str(uuid.uuid4())
-    voice_mp3 = f"temp_{uid}.mp3"
-    voice_wav = f"temp_{uid}.wav"
-
+@app.post("/generate")
+async def generate_audio(request: Request):
     try:
-        # Generate MP3 using gTTS
-        tts = gTTS(text=text, lang="en")
-        tts.save(voice_mp3)
+        data = await request.json()
+        text = data.get("text")
+        if not text:
+            return JSONResponse(status_code=400, content={"error": "No text provided"})
 
-        # Convert MP3 to WAV using ffmpeg-python
-        ffmpeg.input(voice_mp3).output(voice_wav).run(overwrite_output=True)
+        filename = f"{uuid.uuid4()}.mp3"
+        tts = gTTS(text)
+        tts.save(filename)
 
-        # Serve the WAV file
-        return FileResponse(path=voice_wav, media_type="audio/wav", filename="voice.wav")
+        remove_file_later(filename, delay=10)
 
+        return FileResponse(
+            path=filename,
+            filename="voiceover.mp3",
+            media_type="audio/mpeg"
+        )
     except Exception as e:
-        return {"error": str(e)}
-
-    finally:
-        # Clean up files after response (best effort)
-        def safe_unlink(path):
-            try:
-                os.remove(path)
-            except:
-                pass
-
-        safe_unlink(voice_mp3)
-        # Comment the below line if you want to let client download it first
-        # safe_unlink(voice_wav)
+        return JSONResponse(status_code=500, content={"error": str(e)})
